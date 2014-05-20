@@ -1,0 +1,195 @@
+#!/usr/bin/env perl
+
+#
+# Given a georeferenced KMZ containing a GroundOverlay image, convert it to a
+# shapefile. See the README.markdown file included for usage details.
+#
+# Author: Tom Ryder <tom@sanctum.geek.nz>
+# Copyright: 2014 Inspire Net Limited
+# Version: 1.3
+# License: GPLv3
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# $Id$
+#
+package Inspire::Geo::KMZGroundOverlayToShapefile;
+
+# Force me to write this properly
+use strict;      # dpkg: perl-base
+use warnings;    # dpkg: perl-base
+use utf8;        # dpkg: perl-base
+use autodie;     # dpkg: perl-modules
+
+# Require at least Perl 5.10
+use 5.010_001;
+
+# Decree package version
+our $VERSION = 1.3;
+
+# Load required CPAN modules
+use Carp;                                           # dpkg: perl-base
+use Cwd qw(abs_path);                               # dpkg: perl-base
+use English qw(-no_match_vars);                     # dpkg: perl-modules
+use File::Copy;                                     # dpkg: perl-modules
+use File::Temp qw(tempfile tempdir);                # dpkg: perl-modules
+use File::Which;                                    # dpkg: libfile-which-perl
+use Geo::OGR;                                       # dpkg: libgdal-perl
+use Getopt::Long;                                   # dpkg: perl-base
+use IO::Uncompress::Unzip qw(unzip $UnzipError);    # dpkg: perl
+use Readonly;                                       # dpkg: libreadonly-perl
+use XML::Simple;                                    # dpkg: libxml-simple-perl
+
+# Load module from included libdir
+use Inspire::Geo;
+
+# Find the two binaries we need, give up if we can't
+Readonly::Scalar my $CONVERT => which('convert');    # dpkg: imagemagick
+Readonly::Scalar my $POTRACE => which('potrace');    # dpkg: potrace
+if ( !-f $CONVERT ) {
+    croak('Couldn\'t find required convert(1) binary!');
+}
+if ( !-f $POTRACE ) {
+    croak('Couldn\'t find required potrace(1) binary!');
+}
+
+# Check arguments and parse options
+my ( $source, $target, $projection, $shapefile, $image );
+my $result = GetOptions(
+    'source=s'     => \$source,
+    'target=s'     => \$target,
+    'projection=s' => \$projection,
+    'shapefile=s'  => \$shapefile,
+    'image=s'      => \$image,
+);
+if ( !defined $source ) {
+    printf {*STDERR} "ERROR: Need to specify a --source KMZ file.\n";
+    exit 1;
+}
+if ( !defined $target ) {
+    printf {*STDERR} "ERROR: Need to specify a --target directory.\n";
+    exit 1;
+}
+if ( !defined $projection ) {
+    printf {*STDERR} "ERROR: Need to specify a --projection file.\n";
+    exit 1;
+}
+if ( !defined $shapefile ) {
+    printf {*STDERR} "ERROR: Need to specify a name for the --shapefile.\n";
+    exit 1;
+}
+if ( !defined $image ) {
+    printf {*STDERR}
+      "ERROR: Need to specify a relative path to an --image within the KMZ.\n";
+    exit 1;
+}
+
+# Check the relevant directories exist
+$source     = abs_path($source);
+$target     = abs_path($target);
+$projection = abs_path($projection);
+if ( !-f $source ) {
+    printf {*STDERR} "ERROR: Source file %s doesn't seem to exist.\n", $source;
+    exit 1;
+}
+if ( !-d $target ) {
+    printf {*STDERR} "ERROR: Target directory %s doesn't seem to exist.\n",
+      $target;
+    exit 1;
+}
+if ( !-f $projection ) {
+    printf {*STDERR} "ERROR: Projection file %s doesn't seem to exist.\n",
+      $projection;
+    exit 1;
+}
+
+# Create temporary files for the KML, PNG, PBM, and SVG files
+my $files = {};
+foreach my $type (qw(kml png pbm svg)) {
+    my ( $file, $name ) =
+         tempfile( undef, SUFFIX => ( sprintf '.%s', $type ), UNLINK => 1 )
+      or croak( sprintf 'Could not create temporary file for %s.', uc $type );
+    $files->{$type} = {
+        file => $file,
+        name => $name
+    };
+}
+
+# Unzip target files
+unzip( $source => $files->{kml}->{name}, Name => 'doc.kml' )
+  or croak( sprintf 'Could not extract KML file: %s', $UnzipError );
+unzip( $source => $files->{png}->{name}, Name => $image )
+  or croak( sprintf 'Could not extract PNG file: %s', $UnzipError );
+
+# Convert the PNG file to PBM using ImageMagick's convert(1)
+my $converted = system $CONVERT, $files->{png}->{name}, $files->{pbm}->{name};
+if ( $converted != 0 ) {
+    croak('Failed to convert the image to PBM!');
+}
+
+# Convert the PNG file to PBM using ImageMagick's 'convert', and thence to SVG
+# using potrace, with pure polygons (no curves)
+my $traced = system $POTRACE, q{-a}, q{-1}, q{-s}, $files->{pbm}->{name}, q{-o},
+  $files->{svg}->{name};
+if ( $traced != 0 ) {
+    croak('Failed to trace the PBM image into SVG!');
+}
+
+# Get the contents of the KML and SVG files
+my $xml = XML::Simple->new();
+my $kml = $xml->XMLin( $files->{kml}->{name} );
+my $svg = $xml->XMLin( $files->{svg}->{name} );
+
+# Construct polygon coordinates from KML and SVG
+my $polygons = Inspire::Geo::polygons( $kml, $svg );
+
+# Create OGR datasource
+my $ogr_dir = tempdir( CLEANUP => 1 );
+my $ogr_datasource = Geo::OGR::Driver('ESRI Shapefile')->Create( $target, {} );
+my $ogr_layer =
+  $ogr_datasource->CreateLayer( $shapefile, undef, 'MultiPolygon' );
+my $ogr_feature      = Geo::OGR::Feature->new( Geo::OGR::FeatureDefn->new() );
+my $ogr_multipolygon = Geo::OGR::Geometry->create('MultiPolygon');
+
+# Add all the polygons to the datasource
+foreach my $polygon ( @{$polygons} ) {
+    my $ogr_polygon = Geo::OGR::Geometry->create('Polygon');
+
+    # Add all the polygon's rings. There should be at least one. If there is
+    # more than one, those rings will be interpreted as inner rings, meaning
+    # they designate areas that are not part of the polygon
+    foreach my $ring ( @{$polygon} ) {
+        my $ogr_ring = Geo::OGR::Geometry->create('LinearRing');
+
+        # Add all the ring's points. Add the first point again at the end,
+        # to close the ring.
+        foreach my $point ( @{$ring} ) {
+            $ogr_ring->AddPoint_2D( $point->[0], $point->[1] );
+        }
+        $ogr_ring->AddPoint_2D( $ring->[0]->[0], $ring->[0]->[1] );
+
+        # Add the ring into the polygon
+        $ogr_polygon->AddGeometry($ogr_ring);
+    }
+
+    # Add the polygon into the multipolygon
+    $ogr_multipolygon->AddGeometry($ogr_polygon);
+}
+
+# Link all the objects together
+$ogr_feature->Geometry($ogr_multipolygon);
+$ogr_layer->CreateFeature($ogr_feature);
+
+# Write a projection file to the datasource, and we're done
+copy( $projection, ( sprintf '%s/%s.prj', $target, $shapefile ) );
+
